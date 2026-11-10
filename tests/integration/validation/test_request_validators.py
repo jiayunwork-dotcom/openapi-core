@@ -4,16 +4,21 @@ import pytest
 
 from openapi_core import OpenAPI
 from openapi_core import V30RequestValidator
+from openapi_core.deserializing.media_types.exceptions import (
+    MediaTypeDeserializeError,
+)
 from openapi_core.templating.media_types.exceptions import MediaTypeNotFound
 from openapi_core.templating.paths.exceptions import OperationNotFound
 from openapi_core.templating.paths.exceptions import PathNotFound
 from openapi_core.templating.security.exceptions import SecurityNotFound
 from openapi_core.testing import MockRequest
+from openapi_core.validation.request.exceptions import InvalidRequestBody
 from openapi_core.validation.request.exceptions import MissingRequiredParameter
 from openapi_core.validation.request.exceptions import (
     RequestBodyValidationError,
 )
 from openapi_core.validation.request.exceptions import SecurityValidationError
+from openapi_core.validation.schemas.exceptions import InvalidSchemaValue
 
 
 class TestRequestValidator:
@@ -241,3 +246,179 @@ class TestRequestValidator:
         result = spec.validate_request(request)
 
         assert result is None
+
+
+class TestMultipartMixedRequestValidator:
+    """OpenAPI 3.2 Encoding By Position request body validation."""
+
+    def _build_spec(self, media_type):
+        return OpenAPI.from_dict(
+            {
+                "openapi": "3.2.0",
+                "info": {"version": "0", "title": "test"},
+                "paths": {
+                    "/test": {
+                        "post": {
+                            "requestBody": {
+                                "required": True,
+                                "content": {"multipart/mixed": media_type},
+                            },
+                            "responses": {"200": {"description": ""}},
+                        }
+                    }
+                },
+            }
+        )
+
+    def test_multipart_mixed_valid(self):
+        spec = self._build_spec(
+            {
+                "schema": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "object"},
+                        {"type": "string"},
+                    ],
+                    "items": {"type": "string"},
+                },
+                "prefixEncoding": [{}, {"contentType": "text/plain"}],
+                "itemEncoding": {"contentType": "text/plain"},
+            }
+        )
+        data = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 1}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/html\n\n"
+            b"hello\n"
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"world\n"
+            b"--BOUNDARY--\n"
+        )
+        request = MockRequest(
+            "http://localhost",
+            "post",
+            "/test",
+            content_type="multipart/mixed; boundary=BOUNDARY",
+            data=data,
+        )
+
+        result = spec.validate_request(request)
+
+        assert result is None
+
+    def test_multipart_mixed_nested_valid(self):
+        spec = self._build_spec(
+            {
+                "schema": {
+                    "type": "array",
+                    "prefixItems": [
+                        {
+                            "type": "array",
+                            "prefixItems": [
+                                {"type": "object"},
+                                {"type": "string"},
+                            ],
+                        }
+                    ],
+                },
+                "prefixEncoding": [
+                    {
+                        "contentType": "multipart/mixed",
+                        "prefixEncoding": [
+                            {"contentType": "application/json"},
+                            {},
+                        ],
+                    }
+                ],
+            }
+        )
+        inner_body = (
+            b"--INNER\n"
+            b"Content-Type: application/json\n\n"
+            b'{"k": "v"}\n'
+            b"--INNER\n"
+            b"Content-Type: text/plain\n\n"
+            b"nested\n"
+            b"--INNER--\n"
+        )
+        data = (
+            b"--OUTER\n"
+            b'Content-Type: multipart/mixed; boundary="INNER"\n\n'
+            + inner_body
+            + b"--OUTER--\n"
+        )
+        request = MockRequest(
+            "http://localhost",
+            "post",
+            "/test",
+            content_type='multipart/mixed; boundary="OUTER"',
+            data=data,
+        )
+
+        result = spec.validate_request(request)
+
+        assert result is None
+
+    def test_multipart_mixed_deserialize_error(self):
+        spec = self._build_spec(
+            {
+                "schema": {
+                    "type": "array",
+                    "prefixItems": [{"type": "object"}],
+                },
+                "prefixEncoding": [{"contentType": "application/json"}],
+            }
+        )
+        data = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b"{not valid json\n"
+            b"--BOUNDARY--\n"
+        )
+        request = MockRequest(
+            "http://localhost",
+            "post",
+            "/test",
+            content_type="multipart/mixed; boundary=BOUNDARY",
+            data=data,
+        )
+
+        with pytest.raises(RequestBodyValidationError) as exc_info:
+            spec.validate_request(request)
+
+        assert isinstance(exc_info.value, RequestBodyValidationError)
+        assert not isinstance(exc_info.value, InvalidRequestBody)
+        assert isinstance(exc_info.value.__cause__, MediaTypeDeserializeError)
+
+    def test_multipart_mixed_invalid_schema_value(self):
+        spec = self._build_spec(
+            {
+                "schema": {
+                    "type": "array",
+                    "prefixItems": [{"type": "object"}],
+                },
+                "prefixEncoding": [{"contentType": "application/json"}],
+            }
+        )
+        # valid JSON, but the decoded value does not match the array schema
+        data = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'"just a string"\n'
+            b"--BOUNDARY--\n"
+        )
+        request = MockRequest(
+            "http://localhost",
+            "post",
+            "/test",
+            content_type="multipart/mixed; boundary=BOUNDARY",
+            data=data,
+        )
+
+        with pytest.raises(InvalidRequestBody) as exc_info:
+            spec.validate_request(request)
+
+        assert isinstance(exc_info.value.__cause__, InvalidSchemaValue)

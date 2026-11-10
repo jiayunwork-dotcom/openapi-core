@@ -9,6 +9,7 @@ from openapi_core.deserializing.media_types.factories import (
 from openapi_core.deserializing.media_types.util import binary_loads
 from openapi_core.deserializing.media_types.util import data_form_loads
 from openapi_core.deserializing.media_types.util import json_loads
+from openapi_core.deserializing.media_types.util import multipart_mixed_loads
 from openapi_core.deserializing.media_types.util import plain_loads
 from openapi_core.deserializing.media_types.util import urlencoded_form_loads
 from openapi_core.deserializing.media_types.util import xml_loads
@@ -27,5 +28,6 @@ media_type_deserializers: MediaTypeDeserializersDict = defaultdict(
         "application/xhtml+xml": xml_loads,
         "application/x-www-form-urlencoded": urlencoded_form_loads,
         "multipart/form-data": data_form_loads,
+        "multipart/mixed": multipart_mixed_loads,
     }
 )

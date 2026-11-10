@@ -8,9 +8,14 @@ from openapi_core.deserializing.exceptions import DeserializeError
 from openapi_core.deserializing.media_types import (
     media_type_deserializers as default_media_type_deserializers,
 )
+from openapi_core.deserializing.media_types.datatypes import MultipartPart
+from openapi_core.deserializing.media_types.exceptions import (
+    MediaTypeDeserializeError,
+)
 from openapi_core.deserializing.media_types.factories import (
     MediaTypeDeserializersFactory,
 )
+from openapi_core.deserializing.media_types.util import multipart_mixed_loads
 from openapi_core.validation.schemas import oas31_schema_validators_factory
 
 
@@ -27,6 +32,8 @@ class TestMediaTypeDeserializer:
             schema=None,
             schema_validator=None,
             encoding=None,
+            prefix_encoding=None,
+            item_encoding=None,
             parameters=None,
             media_type_deserializers=default_media_type_deserializers,
             extra_media_type_deserializers=None,
@@ -42,6 +49,8 @@ class TestMediaTypeDeserializer:
                 schema_validator=schema_validator,
                 parameters=parameters,
                 encoding=encoding,
+                prefix_encoding=prefix_encoding,
+                item_encoding=item_encoding,
                 extra_media_type_deserializers=extra_media_type_deserializers,
             )
 
@@ -965,3 +974,472 @@ class TestMediaTypeDeserializer:
         assert result == {
             "file": b"\xff\xfe",
         }
+
+
+class TestMultipartMixedDeserializer:
+    """OpenAPI 3.2 Encoding By Position for unnamed multipart media types."""
+
+    @pytest.fixture
+    def spec(self):
+        return SchemaPath.from_dict({})
+
+    @pytest.fixture
+    def deserializer_factory(self, spec):
+        def create_deserializer(
+            mimetype,
+            schema=None,
+            prefix_encoding=None,
+            item_encoding=None,
+            parameters=None,
+            media_type_deserializers=default_media_type_deserializers,
+        ):
+            return MediaTypeDeserializersFactory.from_schema_casters_factory(
+                oas31_schema_casters_factory,
+                media_type_deserializers=media_type_deserializers,
+            ).create(
+                spec,
+                mimetype,
+                schema=schema,
+                parameters=parameters,
+                prefix_encoding=prefix_encoding,
+                item_encoding=item_encoding,
+            )
+
+        return create_deserializer
+
+    def test_multipart_mixed_loads_keeps_order_headers_and_payloads(self):
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"author": "me"}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain; charset=utf-8\n\n"
+            b"hello\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = multipart_mixed_loads(value, boundary="BOUNDARY")
+
+        assert result == [
+            MultipartPart(
+                content_type="application/json",
+                parameters={},
+                payload=b'{"author": "me"}',
+            ),
+            MultipartPart(
+                content_type="text/plain",
+                parameters={"charset": "utf-8"},
+                payload=b"hello",
+            ),
+        ]
+
+    def test_multipart_mixed_loads_empty_body(self):
+        assert multipart_mixed_loads(b"", boundary="BOUNDARY") == []
+
+    def test_prefix_encoding_decodes_parts_by_position(
+        self, deserializer_factory
+    ):
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [
+                    {"type": "object"},
+                    {"type": "string"},
+                ],
+            }
+        )
+        prefix_encoding = SchemaPath.from_dict(
+            [
+                {},
+                {"contentType": "text/plain"},
+            ]
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        # the second part declares a different Content-Type header,
+        # the encoding object's contentType takes precedence
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"author": "me"}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/html\n\n"
+            b"hello\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == [{"author": "me"}, "hello"]
+
+    def test_default_content_types_derived_from_schema(
+        self, deserializer_factory
+    ):
+        # no encoding objects at all
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [
+                    {"type": "object"},
+                    {"type": "string"},
+                ],
+            }
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 1}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"plain text\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        # object defaults to application/json, string defaults to text/plain
+        assert result == [{"id": 1}, "plain text"]
+
+    def test_encoding_object_without_content_type_uses_default(
+        self, deserializer_factory
+    ):
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [
+                    {"type": "object"},
+                    {"type": "string"},
+                ],
+            }
+        )
+        prefix_encoding = SchemaPath.from_dict([{}, {}])
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 1}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"plain text\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == [{"id": 1}, "plain text"]
+
+    def test_item_encoding_applies_beyond_prefix_encoding(
+        self, deserializer_factory
+    ):
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [{"type": "object"}],
+                "items": {"type": "string"},
+            }
+        )
+        prefix_encoding = SchemaPath.from_dict([{}])
+        item_encoding = SchemaPath.from_dict({"contentType": "text/plain"})
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            item_encoding=item_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 1}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"first\n"
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"second\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == [{"id": 1}, "first", "second"]
+
+    def test_items_schema_drives_default_content_type(
+        self, deserializer_factory
+    ):
+        # no itemEncoding: trailing parts fall back to the items schema,
+        # an object schema defaults to application/json
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [{"type": "string"}],
+                "items": {"type": "object"},
+            }
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"label\n"
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 2}\n'
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == ["label", {"id": 2}]
+
+    def test_fewer_parts_than_prefix_encoding_is_not_an_error(
+        self, deserializer_factory
+    ):
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [
+                    {"type": "string"},
+                    {"type": "string"},
+                ],
+            }
+        )
+        prefix_encoding = SchemaPath.from_dict(
+            [
+                {"contentType": "text/plain"},
+                {"contentType": "text/plain"},
+                {"contentType": "text/plain"},
+            ]
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"only\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        # the two unused encoding objects are simply ignored
+        assert result == ["only"]
+
+    def test_encoding_content_type_overrides_part_header(
+        self, deserializer_factory
+    ):
+        schema = SchemaPath.from_dict(
+            {"type": "array", "prefixItems": [{"type": "string"}]}
+        )
+        prefix_encoding = SchemaPath.from_dict([{"contentType": "text/plain"}])
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 1}\n'
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        # decoded as text even though the part claims application/json
+        assert result == ['{"id": 1}']
+
+    def test_binary_part_stays_bytes(self, deserializer_factory):
+        schema = SchemaPath.from_dict({"type": "array", "prefixItems": [{}]})
+        prefix_encoding = SchemaPath.from_dict([{"contentType": "image/png"}])
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: image/png\n\n"
+            b"\x89PNG binary\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == [b"\x89PNG binary"]
+
+    def test_nested_multipart_part(self, deserializer_factory):
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "array",
+                        "prefixItems": [
+                            {"type": "object"},
+                            {"type": "string"},
+                        ],
+                        "items": {"type": "string"},
+                    }
+                ],
+            }
+        )
+        prefix_encoding = SchemaPath.from_dict(
+            [
+                {
+                    "contentType": "multipart/mixed",
+                    "prefixEncoding": [
+                        {"contentType": "application/json"},
+                        {},
+                    ],
+                    "itemEncoding": {"contentType": "text/plain"},
+                }
+            ]
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "OUTER"},
+        )
+        inner_body = (
+            b"--INNER\n"
+            b"Content-Type: application/json\n\n"
+            b'{"k": "v"}\n'
+            b"--INNER\n"
+            b"Content-Type: text/html\n\n"
+            b"plain text\n"
+            b"--INNER\n"
+            b"Content-Type: text/plain\n\n"
+            b"trailing\n"
+            b"--INNER--\n"
+        )
+        value = (
+            b"--OUTER\n"
+            b'Content-Type: multipart/mixed; boundary="INNER"\n\n'
+            + inner_body
+            + b"--OUTER--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        # nested boundary comes from the part's own Content-Type header
+        assert result == [[{"k": "v"}, "plain text", "trailing"]]
+
+    def test_nested_multipart_part_without_inner_encoding(
+        self, deserializer_factory
+    ):
+        # nested encoding object without prefixEncoding/itemEncoding,
+        # inner parts fall back to their position schema defaults
+        schema = SchemaPath.from_dict(
+            {
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "type": "array",
+                        "prefixItems": [
+                            {"type": "object"},
+                            {"type": "string"},
+                        ],
+                    }
+                ],
+            }
+        )
+        prefix_encoding = SchemaPath.from_dict(
+            [{"contentType": "multipart/mixed"}]
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "OUTER"},
+        )
+        inner_body = (
+            b"--INNER\n"
+            b"Content-Type: application/json\n\n"
+            b'{"k": "v"}\n'
+            b"--INNER\n"
+            b"Content-Type: text/plain\n\n"
+            b"plain text\n"
+            b"--INNER--\n"
+        )
+        value = (
+            b"--OUTER\n"
+            b'Content-Type: multipart/mixed; boundary="INNER"\n\n'
+            + inner_body
+            + b"--OUTER--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == [[{"k": "v"}, "plain text"]]
+
+    def test_undecodable_part_raises_media_type_deserialize_error(
+        self, deserializer_factory
+    ):
+        schema = SchemaPath.from_dict(
+            {"type": "array", "prefixItems": [{"type": "object"}]}
+        )
+        prefix_encoding = SchemaPath.from_dict(
+            [{"contentType": "application/json"}]
+        )
+        deserializer = deserializer_factory(
+            "multipart/mixed",
+            schema=schema,
+            prefix_encoding=prefix_encoding,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b"{not valid json\n"
+            b"--BOUNDARY--\n"
+        )
+
+        with pytest.raises(MediaTypeDeserializeError):
+            deserializer.deserialize(value)
+
+    def test_form_data_with_array_schema_is_not_decoded_by_position(
+        self, deserializer_factory
+    ):
+        # multipart/form-data stays on the named-property path
+        schema = SchemaPath.from_dict({"type": "array"})
+        deserializer = deserializer_factory(
+            "multipart/form-data",
+            schema=schema,
+            parameters={"boundary": "BOUNDARY"},
+        )
+        value = (
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\nMIME-Version: 1.0\n"
+            b'Content-Disposition: form-data; name="field"\n\n'
+            b"value\n"
+            b"--BOUNDARY--\n"
+        )
+
+        result = deserializer.deserialize(value)
+
+        assert result == {}

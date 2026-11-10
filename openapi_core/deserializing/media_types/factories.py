@@ -64,6 +64,8 @@ class MediaTypeDeserializersFactory:
         schema_validator: Optional[SchemaValidator] = None,
         parameters: Optional[Mapping[str, str]] = None,
         encoding: Optional[SchemaPath] = None,
+        prefix_encoding: Optional[SchemaPath] = None,
+        item_encoding: Optional[SchemaPath] = None,
         extra_media_type_deserializers: Optional[
             MediaTypeDeserializersDict
         ] = None,
@@ -103,5 +105,7 @@ class MediaTypeDeserializersFactory:
             schema_validator=schema_validator,
             schema_caster=schema_caster,
             encoding=encoding,
+            prefix_encoding=prefix_encoding,
+            item_encoding=item_encoding,
             **parameters,
         )

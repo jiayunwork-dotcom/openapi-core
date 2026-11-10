@@ -619,3 +619,143 @@ class TestRequestUnmarshaller:
             schema for schema in calls if "requestBody#content" in str(schema)
         ]
         assert len(body_calls) == 1
+
+    def test_request_body_multipart_mixed_by_position(self):
+        from openapi_core import OpenAPI
+
+        spec = OpenAPI.from_dict(
+            {
+                "openapi": "3.2.0",
+                "info": {"version": "0", "title": "test"},
+                "paths": {
+                    "/test": {
+                        "post": {
+                            "requestBody": {
+                                "required": True,
+                                "content": {
+                                    "multipart/mixed": {
+                                        "schema": {
+                                            "type": "array",
+                                            "prefixItems": [
+                                                {"type": "object"},
+                                                {"type": "string"},
+                                            ],
+                                            "items": {"type": "string"},
+                                        },
+                                        "prefixEncoding": [
+                                            {},
+                                            {"contentType": "text/plain"},
+                                        ],
+                                        "itemEncoding": {
+                                            "contentType": "text/plain"
+                                        },
+                                    }
+                                },
+                            },
+                            "responses": {"200": {"description": ""}},
+                        }
+                    }
+                },
+            }
+        )
+        data = (
+            b"--BOUNDARY\n"
+            b"Content-Type: application/json\n\n"
+            b'{"id": 1}\n'
+            b"--BOUNDARY\n"
+            b"Content-Type: text/html\n\n"
+            b"hello\n"
+            b"--BOUNDARY\n"
+            b"Content-Type: text/plain\n\n"
+            b"world\n"
+            b"--BOUNDARY--\n"
+        )
+        request = MockRequest(
+            "http://localhost",
+            "post",
+            "/test",
+            content_type="multipart/mixed; boundary=BOUNDARY",
+            data=data,
+        )
+
+        result = spec.unmarshal_request(request)
+
+        assert result.errors == []
+        # body is a list, each part decoded in occurrence order
+        assert result.body == [{"id": 1}, "hello", "world"]
+
+    def test_request_body_multipart_mixed_nested(self):
+        from openapi_core import OpenAPI
+
+        spec = OpenAPI.from_dict(
+            {
+                "openapi": "3.2.0",
+                "info": {"version": "0", "title": "test"},
+                "paths": {
+                    "/test": {
+                        "post": {
+                            "requestBody": {
+                                "required": True,
+                                "content": {
+                                    "multipart/mixed": {
+                                        "schema": {
+                                            "type": "array",
+                                            "prefixItems": [
+                                                {
+                                                    "type": "array",
+                                                    "prefixItems": [
+                                                        {"type": "object"},
+                                                        {"type": "string"},
+                                                    ],
+                                                }
+                                            ],
+                                        },
+                                        "prefixEncoding": [
+                                            {
+                                                "contentType": "multipart/mixed",
+                                                "prefixEncoding": [
+                                                    {
+                                                        "contentType": (
+                                                            "application/json"
+                                                        )
+                                                    },
+                                                    {},
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                },
+                            },
+                            "responses": {"200": {"description": ""}},
+                        }
+                    }
+                },
+            }
+        )
+        inner_body = (
+            b"--INNER\n"
+            b"Content-Type: application/json\n\n"
+            b'{"k": "v"}\n'
+            b"--INNER\n"
+            b"Content-Type: text/plain\n\n"
+            b"nested\n"
+            b"--INNER--\n"
+        )
+        data = (
+            b"--OUTER\n"
+            b'Content-Type: multipart/mixed; boundary="INNER"\n\n'
+            + inner_body
+            + b"--OUTER--\n"
+        )
+        request = MockRequest(
+            "http://localhost",
+            "post",
+            "/test",
+            content_type='multipart/mixed; boundary="OUTER"',
+            data=data,
+        )
+
+        result = spec.unmarshal_request(request)
+
+        assert result.errors == []
+        assert result.body == [[{"k": "v"}, "nested"]]

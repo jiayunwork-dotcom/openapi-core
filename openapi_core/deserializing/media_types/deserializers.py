@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import List
 from typing import Mapping
 from typing import Optional
 from xml.etree.ElementTree import ParseError
@@ -12,6 +13,7 @@ from openapi_core.deserializing.media_types.datatypes import (
 from openapi_core.deserializing.media_types.datatypes import (
     MediaTypeDeserializersDict,
 )
+from openapi_core.deserializing.media_types.datatypes import MultipartPart
 from openapi_core.deserializing.media_types.exceptions import (
     MediaTypeDeserializeError,
 )
@@ -75,6 +77,8 @@ class MediaTypeDeserializer:
         schema_validator: Optional[SchemaValidator] = None,
         schema_caster: Optional["SchemaCaster"] = None,
         encoding: Optional[SchemaPath] = None,
+        prefix_encoding: Optional[SchemaPath] = None,
+        item_encoding: Optional[SchemaPath] = None,
         **parameters: str,
     ):
         self.spec = spec
@@ -85,6 +89,8 @@ class MediaTypeDeserializer:
         self.schema_validator = schema_validator
         self.schema_caster = schema_caster
         self.encoding = encoding
+        self.prefix_encoding = prefix_encoding
+        self.item_encoding = item_encoding
         self.parameters = parameters
 
     def deserialize(self, value: bytes) -> Any:
@@ -128,14 +134,24 @@ class MediaTypeDeserializer:
             schema_validator=schema_validator,
             schema_caster=schema_caster,
             encoding=self.encoding,
+            prefix_encoding=self.prefix_encoding,
+            item_encoding=self.item_encoding,
             **self.parameters,
         )
 
-    def decode(
-        self, location: Mapping[str, Any], schema_only: bool = False
-    ) -> Mapping[str, Any]:
+    def decode(self, location: Any, schema_only: bool = False) -> Any:
         # schema is required for multipart
         assert self.schema is not None
+
+        # positional (unnamed) multipart media types are modeled as arrays
+        if self.is_by_position_multipart():
+            return self.decode_by_position(
+                location,
+                self.schema,
+                self.prefix_encoding,
+                self.item_encoding,
+            )
+
         properties: dict[str, Any] = {}
 
         # For urlencoded/multipart, use caster for oneOf/anyOf detection if validator available
@@ -175,6 +191,103 @@ class MediaTypeDeserializer:
             return properties
 
         return properties
+
+    def is_by_position_multipart(self) -> bool:
+        # Encoding By Position applies to unnamed multipart media types
+        # (e.g. multipart/mixed) described with an array schema
+        return (
+            self.mimetype.startswith("multipart")
+            and self.mimetype != "multipart/form-data"
+            and self.schema is not None
+            and (self.schema / "type").read_str(None) == "array"
+        )
+
+    def decode_by_position(
+        self,
+        parts: List[MultipartPart],
+        schema: SchemaPath,
+        prefix_encoding: Optional[SchemaPath],
+        item_encoding: Optional[SchemaPath],
+    ) -> List[Any]:
+        prefix_encodings = (
+            list(prefix_encoding) if prefix_encoding is not None else []
+        )
+        result: List[Any] = []
+        for index, part in enumerate(parts):
+            part_schema = self.get_position_schema(schema, index)
+            part_encoding = self.get_position_encoding(
+                index, prefix_encodings, item_encoding
+            )
+            result.append(
+                self.decode_position_part(part, part_schema, part_encoding)
+            )
+        return result
+
+    def get_position_schema(
+        self, schema: SchemaPath, index: int
+    ) -> SchemaPath:
+        if "prefixItems" in schema:
+            prefix_items = list(schema / "prefixItems")
+            if index < len(prefix_items):
+                return prefix_items[index]
+        if "items" in schema:
+            return schema / "items"
+        return SchemaPath.from_dict({})
+
+    def get_position_encoding(
+        self,
+        index: int,
+        prefix_encodings: List[SchemaPath],
+        item_encoding: Optional[SchemaPath],
+    ) -> Optional[SchemaPath]:
+        # a shorter parts list than prefixEncoding is not an error,
+        # the additional encoding objects are simply ignored
+        if index < len(prefix_encodings):
+            return prefix_encodings[index]
+        return item_encoding
+
+    def decode_position_part(
+        self,
+        part: MultipartPart,
+        part_schema: SchemaPath,
+        part_encoding: Optional[SchemaPath],
+    ) -> Any:
+        part_content_type = get_content_type(part_schema, part_encoding)
+        if part_content_type.startswith("multipart"):
+            return self.decode_nested_multipart_part(
+                part, part_schema, part_encoding, part_content_type
+            )
+        # the encoding object's contentType takes precedence over the
+        # Content-Type header declared by the part itself
+        return self.media_types_deserializer.deserialize(
+            part_content_type, part.payload
+        )
+
+    def decode_nested_multipart_part(
+        self,
+        part: MultipartPart,
+        part_schema: SchemaPath,
+        part_encoding: Optional[SchemaPath],
+        part_content_type: str,
+    ) -> List[Any]:
+        # the nested boundary is taken from the part's own Content-Type header
+        boundary = part.parameters.get("boundary", "")
+        nested_parts = self.media_types_deserializer.deserialize(
+            part_content_type, part.payload, boundary=boundary
+        )
+        nested_prefix_encoding = None
+        nested_item_encoding = None
+        if part_encoding is not None:
+            if "prefixEncoding" in part_encoding:
+                nested_prefix_encoding = part_encoding / "prefixEncoding"
+            if "itemEncoding" in part_encoding:
+                nested_item_encoding = part_encoding / "itemEncoding"
+        return self.decode_by_position(
+            nested_parts,
+            part_schema,
+            nested_prefix_encoding,
+            nested_item_encoding,
+        )
 
     def decode_property(
         self,

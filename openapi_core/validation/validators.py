@@ -140,6 +140,8 @@ class BaseValidator:
         encoding = None
         if "encoding" in media_type:
             encoding = media_type.get("encoding")
+        prefix_encoding = media_type.get("prefixEncoding")
+        item_encoding = media_type.get("itemEncoding")
         schema_validator = None
         if schema is not None:
             schema_validator = self.schema_validators_factory.create(
@@ -157,6 +159,8 @@ class BaseValidator:
             schema_validator=schema_validator,
             parameters=parameters,
             encoding=encoding,
+            prefix_encoding=prefix_encoding,
+            item_encoding=item_encoding,
             extra_media_type_deserializers=self.extra_media_type_deserializers,
         )
         return deserializer.deserialize(value)
